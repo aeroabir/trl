@@ -46,11 +46,13 @@ from transformers import (
     is_comet_available,
     is_wandb_available,
 )
+# from hf_trainer_modified import Trainer
 from transformers.data.data_collator import DataCollatorMixin
 from transformers.models.auto.modeling_auto import MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES
 from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import EvalLoopOutput
 from transformers.utils import is_peft_available, is_torch_xpu_available
+from transformers.utils.deprecation import deprecate_kwarg
 
 from ..data_utils import maybe_apply_chat_template, maybe_extract_prompt
 from ..models import PreTrainedModelWrapper, create_reference_model
@@ -201,6 +203,9 @@ class DPOTrainer(Trainer):
 
     _tag_names = ["trl", "dpo"]
 
+    @deprecate_kwarg(
+        "tokenizer", "0.16.0", "processing_class", warn_if_greater_or_equal_version=True, raise_if_both_names=True
+    )
     def __init__(
         self,
         model: Optional[Union[PreTrainedModel, nn.Module, str]] = None,
@@ -344,7 +349,8 @@ class DPOTrainer(Trainer):
             )
 
         self.is_encoder_decoder = model.config.is_encoder_decoder
-        self.is_vision_model = model.config.model_type in MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES.keys()
+        # self.is_vision_model = model.config.model_type in MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES.keys()
+        self.is_vision_model = True  # 'microsoft/Phi-3.5-vision-instruct' does not belong to this category, Abir
         self.is_peft_model = is_peft_available() and isinstance(model, PeftModel)
         self.model_adapter_name = args.model_adapter_name
         self.ref_adapter_name = args.ref_adapter_name
@@ -453,7 +459,14 @@ class DPOTrainer(Trainer):
         model.warnings_issued["estimate_tokens"] = True
 
         # Dataset preparation
+        # Dataset has the following keys: ['chosen', 'rejected', 'images', 'prompt']
+        # print(train_dataset[0].keys())
         train_dataset = self._prepare_dataset(train_dataset, processing_class, args, "train")
+        # Dataset has the following keys:
+        # ['images', 'prompt_input_ids', 'pixel_values', 'chosen_input_ids', 'rejected_input_ids', 'image_sizes']
+        # print(train_dataset[0].keys())
+        # print(train_dataset[0]['prompt_input_ids'], len(train_dataset[0]['prompt_input_ids']))
+        # sys.exit('Abir: DPOTrainer')
         if eval_dataset is not None:
             if isinstance(eval_dataset, dict):
                 eval_dataset = {
@@ -553,6 +566,9 @@ class DPOTrainer(Trainer):
             if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
                 map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset"
 
+            # print("Here-Abir", self.is_vision_model)
+            # print(dataset)
+            # print(args.max_prompt_length, args.max_completion_length)
             dataset = dataset.map(
                 self.tokenize_row if not self.is_vision_model else self.process_row,
                 remove_columns=["prompt", "chosen", "rejected"],
@@ -635,9 +651,11 @@ class DPOTrainer(Trainer):
         """
         Same as `tokenize_row` but for vision models. Please refer to `tokenize_row` for more information.
         """
+        add_special_tokens = False
         processor, tokenizer = processing_class, processing_class.tokenizer  # the processing class is a processor
-        processed_features = processor(images=features["images"], text=features["prompt"], add_special_tokens=False)
-
+        # prompt and images need to be processed together
+        # processed_features = processor(images=features["images"], text=features["prompt"], add_special_tokens=False)
+        processed_features = processor(images=features["images"], text=features["prompt"])
         prompt_input_ids = processed_features["input_ids"][0]
         pixel_values = processed_features["pixel_values"][0]
         chosen_input_ids = tokenizer(features["chosen"], add_special_tokens=False)["input_ids"]
@@ -878,6 +896,11 @@ class DPOTrainer(Trainer):
             The completion input IDs and attention masks are padded to the maximum completion length of the chosen
             or rejected sequences.
         """
+        # print("Inside concatenated_inputs:")
+        # for k, v in batch.items():
+            # print(k, len(v) if type(v) is list else v.shape)
+        # print(batch["prompt_input_ids"])
+        # sys.exit('Abir: concatenated_inputs')
         output = {}
 
         # For the prompt, the input_ids are the same for both the chosen and rejected responses
@@ -1099,14 +1122,121 @@ class DPOTrainer(Trainer):
 
         return losses, chosen_rewards, rejected_rewards
 
+    def single_forward(self, model: nn.Module, model_kwargs, input_ids, attention_mask, loss_mask):
+        """Run individually for chosen and rejected part"""
+        # Flush left to reduce the memory usage
+        # [[0, 0, x, x, x, x],  ->  [[x, x, x, x],
+        #  [0, x, x, x, 0, 0]]       [x, x, x, 0]]
+        attention_mask, input_ids, loss_mask = flush_left(attention_mask, input_ids, loss_mask)
+
+        # Truncate right
+        if self.max_length is not None:
+            if self.truncation_mode == "keep_end":
+                input_ids = input_ids[:, -self.max_length :]
+                attention_mask = attention_mask[:, -self.max_length :]
+                loss_mask = loss_mask[:, -self.max_length :]
+            elif self.truncation_mode == "keep_start":
+                input_ids = input_ids[:, : self.max_length]
+                attention_mask = attention_mask[:, : self.max_length]
+                loss_mask = loss_mask[:, : self.max_length]
+            else:
+                raise ValueError(
+                    f"Unknown truncation mode: '{self.truncation_mode}'. Should be one of ['keep_end', "
+                    "'keep_start']."
+                )
+
+        if self.use_logits_to_keep:
+            # Compute logits_to_keep based on loss_mask pattern:
+            # [[0, 0, 0, x, x, x, x],
+            #  [0, 0, 0, x, x, x, 0]]
+            #         ^ start computing logits from here ([:, -(7-3+1):])
+            first_compute_index = loss_mask.nonzero(as_tuple=True)[1].min()
+            logits_to_keep = (loss_mask.shape[1] - first_compute_index).item() + 1  # +1 for the first label
+            model_kwargs["logits_to_keep"] = logits_to_keep
+
+        if self.padding_free:
+            # Flatten the input_ids, position_ids, and loss_mask
+            # input_ids = [[a, b, c, 0], ->     input_ids = [[a, b, c, d, e, f, g]]
+            #              [d, e, f, g]]     position_ids = [[0, 1, 2, 0, 1, 2, 3]]
+            input_ids = input_ids[attention_mask.bool()].unsqueeze(0)
+            loss_mask = loss_mask[attention_mask.bool()].unsqueeze(0)
+            position_ids = attention_mask.cumsum(1)[attention_mask.bool()].unsqueeze(0) - 1
+            model_kwargs["position_ids"] = position_ids
+        else:
+            model_kwargs["attention_mask"] = attention_mask
+
+        # print("Abir: before model call")
+        # print(f"Max. sequence length: {input_ids.shape}")
+        # print('input_ids', input_ids.shape)
+        # for k, v in model_kwargs.items():
+        #     print(k, v.shape if type(v) is not list else len(v))
+        outputs = model(input_ids, **model_kwargs)
+        logits = outputs.logits  # (batch_size, seq_len, vocab_dimension)
+
+        # Offset the logits by one to align with the labels
+        labels = torch.roll(input_ids, shifts=-1, dims=1)
+        loss_mask = torch.roll(loss_mask, shifts=-1, dims=1).bool()
+
+        if self.use_logits_to_keep:
+            # Align labels with logits
+            # logits:    -,  -, [x2, x3, x4, x5, x6]
+            #                     ^ --------- ^       after logits[:, :-1, :]
+            # labels:   [y0, y1, y2, y3, y4, y5, y6]
+            #                         ^ --------- ^   with logits_to_keep=4, [:, -4:]
+            # loss_mask: [0,  0,  0,  1,  1,  1,  1]
+            labels = labels[:, -logits_to_keep:]
+            loss_mask = loss_mask[:, -logits_to_keep:]
+
+        if logits.shape[:2] != labels.shape[:2]:
+            # for llava, the returned logits include the image tokens (placed before the text tokens)
+            seq_len = labels.shape[1]
+            logits = logits[:, -seq_len:]
+
+        # Compute the log probabilities of the labels
+        labels[~loss_mask] = 0  # dummy token; we'll ignore the losses on these tokens later
+        per_token_logps = selective_log_softmax(logits, labels)
+        per_token_logps[~loss_mask] = 0
+        per_token_logps = torch.roll(per_token_logps, shifts=1, dims=1)
+
+        if self.padding_free:
+            # Unflatten the per_token_logps (shape: [1, sum_seq_len] -> [batch_size, seq_len])
+            batch_size, seq_len = attention_mask.shape
+            per_token_logps_ = torch.zeros(
+                batch_size, seq_len, device=outputs.logits.device, dtype=outputs.logits.dtype
+            )
+            per_token_logps_[attention_mask.bool()] = per_token_logps
+            per_token_logps = per_token_logps_
+
+        all_logps = per_token_logps.sum(-1)
+
+        return logits, labels, loss_mask, all_logps
+
+
     def concatenated_forward(self, model: nn.Module, batch: dict[str, Union[list, torch.LongTensor]]):
         """Run the given model on the given batch of inputs, concatenating the chosen and rejected inputs together.
 
         We do this to avoid doing two forward passes, because it's faster for FSDP.
         """
         num_examples = batch["prompt_input_ids"].shape[0]
+        # print(f"Number of examples: {num_examples}")
+        # for k, v in batch.items():
+        #     print(k, v.shape if type(v) is not list else len(v))
+        # prompt_input_ids torch.Size([1, 512])
+        # prompt_attention_mask torch.Size([1, 512])
+        # chosen_input_ids torch.Size([1, 33])
+        # chosen_attention_mask torch.Size([1, 33])
+        # rejected_input_ids torch.Size([1, 41])
+        # rejected_attention_mask torch.Size([1, 41])
+        # image_sizes torch.Size([1, 2])
 
         concatenated_batch = self.concatenated_inputs(batch, padding_value=self.padding_value)
+        # prompt_input_ids torch.Size([2, 512])
+        # prompt_attention_mask torch.Size([2, 512])
+        # image_sizes torch.Size([2, 2])
+        # completion_input_ids torch.Size([2, 41])
+        # completion_attention_mask torch.Size([2, 41])
+        # for k, v in concatenated_batch.items():
+        #     print(k, v.shape if type(v) is not list else len(v))
 
         model_kwargs = {}
         if self.aux_loss_enabled:
@@ -1124,7 +1254,100 @@ class DPOTrainer(Trainer):
         prompt_attention_mask = concatenated_batch["prompt_attention_mask"]
         completion_input_ids = concatenated_batch["completion_input_ids"]
         completion_attention_mask = concatenated_batch["completion_attention_mask"]
-        if self.is_encoder_decoder:
+
+        # Phi-3.5-vision is not encoder_decoder
+        # print("Current Model:", self.is_encoder_decoder)
+        if model.config.model_type == 'phi3_v':
+            # Need to handle prompt and completion separately
+            # since batch_size cannot be more than 1 (concatenation will make
+            # batch size = 2)
+            # first process the chosen
+            prompt_input_ids = batch["prompt_input_ids"]
+            prompt_attention_mask = batch["prompt_attention_mask"]
+            completion_input_ids = batch["chosen_input_ids"]
+            completion_attention_mask = batch["chosen_attention_mask"]
+
+            # now concatenate for prompt-chosen
+            input_ids = torch.cat((prompt_input_ids, completion_input_ids), dim=1)
+            attention_mask = torch.cat((prompt_attention_mask, completion_attention_mask), dim=1)
+            loss_mask = torch.cat(
+                (torch.zeros_like(prompt_attention_mask), completion_attention_mask),
+                dim=1,
+            )
+            # Add the pixel values and attention masks for vision models
+            # take from the original batch (rather than the concatenated one)
+            if "pixel_values" in batch:
+                model_kwargs["pixel_values"] = batch["pixel_values"]
+            else:
+                print('pixel values not present in the batch!')
+            if "pixel_attention_mask" in batch:
+                model_kwargs["pixel_attention_mask"] = batch["pixel_attention_mask"]
+            if "image_sizes" in batch:
+                model_kwargs["image_sizes"] = batch["image_sizes"]
+
+            chosen_logits, chosen_labels, chosen_loss_mask, chosen_logps = \
+                self.single_forward(model, model_kwargs, input_ids, attention_mask, loss_mask)
+            # print(chosen_logits.shape, chosen_logps.shape)
+
+            # Now the rejected one
+            prompt_input_ids = batch["prompt_input_ids"]
+            prompt_attention_mask = batch["prompt_attention_mask"]
+            completion_input_ids = batch["rejected_input_ids"]
+            completion_attention_mask = batch["rejected_attention_mask"]
+
+            # now concatenate for prompt-rejected
+            input_ids = torch.cat((prompt_input_ids, completion_input_ids), dim=1)
+            attention_mask = torch.cat((prompt_attention_mask, completion_attention_mask), dim=1)
+            loss_mask = torch.cat(
+                (torch.zeros_like(prompt_attention_mask), completion_attention_mask),
+                dim=1,
+            )
+
+            rejected_logits, _, rejected_loss_mask, rejected_logps = \
+                self.single_forward(model, model_kwargs, input_ids, attention_mask, loss_mask)
+            # print(rejected_logits.shape, rejected_logps.shape)
+            # print(self.use_weighting)
+            output = {}
+            # TODO: # Eq (2) of the WPO paper: https://huggingface.co/papers/2406.11827
+            # if self.use_weighting:
+            #     with torch.no_grad():
+            #         logprobs = F.log_softmax(logits, dim=-1)
+            #         weights_adjustment_factor = torch.logsumexp(2 * logprobs, dim=-1)  # same as sum(probs**2) in log space
+            #         per_token_logps_adjusted = per_token_logps - weights_adjustment_factor
+            #         all_weights = (per_token_logps_adjusted * loss_mask).sum(-1) / loss_mask.sum(-1)
+            #         chosen_weights = all_weights[:num_examples]
+            #         rejected_weights = all_weights[num_examples:]
+            #         output["policy_weights"] = torch.clamp(torch.exp(chosen_weights + rejected_weights), max=1)
+
+            if self.args.rpo_alpha is not None:
+                # Only use the chosen logits for the RPO loss
+                # Compute the log probabilities of the labels
+                output["nll_loss"] = F.cross_entropy(
+                    torch.flatten(chosen_logits, end_dim=1),
+                    torch.flatten(chosen_labels, end_dim=1), ignore_index=0
+                )
+
+            if self.loss_type == "ipo":
+                chosen_logps = chosen_logps / chosen_loss_mask.sum(-1)
+                rejected_logps = rejected_logps / rejected_loss_mask.sum(-1)
+
+            # Is the dimension correct?
+            output["chosen_logps"] = chosen_logps
+            output["rejected_logps"] = rejected_logps
+
+            # Compute the mean logits
+            mean_chosen_logits = chosen_logits[chosen_loss_mask].mean()
+            mean_rejected_logits = rejected_logits[rejected_loss_mask].mean()
+            output["mean_chosen_logits"] = mean_chosen_logits
+            output["mean_rejected_logits"] = mean_rejected_logits
+
+            if self.aux_loss_enabled:
+                output["aux_loss"] = outputs.aux_loss
+
+            return output
+
+
+        elif self.is_encoder_decoder:
             labels = completion_input_ids
             labels[completion_attention_mask == 0] = self.label_pad_token_id
             outputs = model(
@@ -1203,27 +1426,27 @@ class DPOTrainer(Trainer):
                 labels = labels[:, -logits_to_keep:]
                 loss_mask = loss_mask[:, -logits_to_keep:]
 
-        if logits.shape[:2] != labels.shape[:2]:
-            # for llava, the returned logits include the image tokens (placed before the text tokens)
-            seq_len = labels.shape[1]
-            logits = logits[:, -seq_len:]
+            if logits.shape[:2] != labels.shape[:2]:
+                # for llava, the returned logits include the image tokens (placed before the text tokens)
+                seq_len = labels.shape[1]
+                logits = logits[:, -seq_len:]
 
-        # Compute the log probabilities of the labels
-        labels[~loss_mask] = 0  # dummy token; we'll ignore the losses on these tokens later
-        per_token_logps = selective_log_softmax(logits, labels)
-        per_token_logps[~loss_mask] = 0
-        per_token_logps = torch.roll(per_token_logps, shifts=1, dims=1)
+            # Compute the log probabilities of the labels
+            labels[~loss_mask] = 0  # dummy token; we'll ignore the losses on these tokens later
+            per_token_logps = selective_log_softmax(logits, labels)
+            per_token_logps[~loss_mask] = 0
+            per_token_logps = torch.roll(per_token_logps, shifts=1, dims=1)
 
-        if self.padding_free:
-            # Unflatten the per_token_logps (shape: [1, sum_seq_len] -> [batch_size, seq_len])
-            batch_size, seq_len = attention_mask.shape
-            per_token_logps_ = torch.zeros(
-                batch_size, seq_len, device=outputs.logits.device, dtype=outputs.logits.dtype
-            )
-            per_token_logps_[attention_mask.bool()] = per_token_logps
-            per_token_logps = per_token_logps_
+            if self.padding_free:
+                # Unflatten the per_token_logps (shape: [1, sum_seq_len] -> [batch_size, seq_len])
+                batch_size, seq_len = attention_mask.shape
+                per_token_logps_ = torch.zeros(
+                    batch_size, seq_len, device=outputs.logits.device, dtype=outputs.logits.dtype
+                )
+                per_token_logps_[attention_mask.bool()] = per_token_logps
+                per_token_logps = per_token_logps_
 
-        all_logps = per_token_logps.sum(-1)
+            all_logps = per_token_logps.sum(-1)
 
         output = {}
 
@@ -1348,6 +1571,11 @@ class DPOTrainer(Trainer):
         compute_loss_context_manager = (
             amp.autocast(device_type) if self._peft_has_been_casted_to_bf16 else nullcontext()
         )
+
+        # Abir: does not have 'pixel_values' here
+        # print(inputs)
+        # sys.exit("Abir: compute_loss")
+
         with compute_loss_context_manager:
             loss, metrics = self.get_batch_loss_metrics(model, inputs, train_eval="train")
 
@@ -1438,8 +1666,8 @@ class DPOTrainer(Trainer):
             "eval_logits/chosen": metrics["eval_logits/chosen"],
             "eval_logits/rejected": metrics["eval_logits/rejected"],
         }
-        logits = [v for k, v in logits_dict.items() if k not in ignore_keys]
-        logits = torch.tensor(logits, device=self.accelerator.device)
+        logits = tuple(v.unsqueeze(dim=0) for k, v in logits_dict.items() if k not in ignore_keys)
+        logits = torch.stack(logits).mean(axis=1).to(self.accelerator.device)
         labels = torch.zeros(logits.shape[0], device=self.accelerator.device)
 
         return (loss.detach(), logits, labels)
