@@ -133,8 +133,12 @@ class DataCollatorForPreference(DataCollatorMixin):
         chosen_attention_mask = [torch.ones_like(input_ids) for input_ids in chosen_input_ids]
         rejected_input_ids = [torch.tensor(example["rejected_input_ids"]) for example in examples]
         rejected_attention_mask = [torch.ones_like(input_ids) for input_ids in rejected_input_ids]
-        if "pixel_values" in examples[0]:
+        # 'prompt_input_ids', 'pixel_values', 'chosen_input_ids', 'rejected_input_ids'
+        # 'pixel_values' may appear as None when no image is passed
+        if "pixel_values" in examples[0] and examples[0]['pixel_values'] is not None:
             pixel_values = [torch.tensor(example["pixel_values"]) for example in examples]
+        else:
+            pixel_values = [None] * len(examples)
         if "pixel_attention_mask" in examples[0]:
             pixel_attention_mask = [torch.tensor(example["pixel_attention_mask"]) for example in examples]
         if "ref_chosen_logps" in examples[0] and "ref_rejected_logps" in examples[0]:
@@ -149,7 +153,7 @@ class DataCollatorForPreference(DataCollatorMixin):
         output["chosen_attention_mask"] = pad(chosen_attention_mask, padding_value=0)
         output["rejected_input_ids"] = pad(rejected_input_ids, padding_value=self.pad_token_id)
         output["rejected_attention_mask"] = pad(rejected_attention_mask, padding_value=0)
-        if "pixel_values" in examples[0]:
+        if "pixel_values" in examples[0] and examples[0]['pixel_values'] is not None:
             output["pixel_values"] = pad(pixel_values, padding_value=0.0)
         if "pixel_attention_mask" in examples[0]:
             output["pixel_attention_mask"] = pad(pixel_attention_mask, padding_value=0)
@@ -349,8 +353,10 @@ class DPOTrainer(Trainer):
             )
 
         self.is_encoder_decoder = model.config.is_encoder_decoder
-        # self.is_vision_model = model.config.model_type in MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES.keys()
-        self.is_vision_model = True  # 'microsoft/Phi-3.5-vision-instruct' does not belong to this category, Abir
+        # 'microsoft/Phi-3.5-vision-instruct' does not belong to this category, Abir
+        self.is_vision_model = model.config.model_type in MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES.keys() or \
+            model.config.model_type in ('phi3_v', 'phi4mm')
+        # self.is_vision_model = True
         self.is_peft_model = is_peft_available() and isinstance(model, PeftModel)
         self.model_adapter_name = args.model_adapter_name
         self.ref_adapter_name = args.ref_adapter_name
@@ -657,7 +663,11 @@ class DPOTrainer(Trainer):
         # processed_features = processor(images=features["images"], text=features["prompt"], add_special_tokens=False)
         processed_features = processor(images=features["images"], text=features["prompt"])
         prompt_input_ids = processed_features["input_ids"][0]
-        pixel_values = processed_features["pixel_values"][0]
+        # if there is no image input then processor does not return 'pixel_values'
+        if "pixel_values" in processed_features:
+            pixel_values = processed_features["pixel_values"][0]
+        else:
+            pixel_values = None
         chosen_input_ids = tokenizer(features["chosen"], add_special_tokens=False)["input_ids"]
         rejected_input_ids = tokenizer(features["rejected"], add_special_tokens=False)["input_ids"]
 
@@ -1276,10 +1286,11 @@ class DPOTrainer(Trainer):
             )
             # Add the pixel values and attention masks for vision models
             # take from the original batch (rather than the concatenated one)
+            # Note: 'pixel_values' are not present when there is no image as input
             if "pixel_values" in batch:
                 model_kwargs["pixel_values"] = batch["pixel_values"]
-            else:
-                print('pixel values not present in the batch!')
+            # else:
+            #     print('pixel values not present in the batch!')
             if "pixel_attention_mask" in batch:
                 model_kwargs["pixel_attention_mask"] = batch["pixel_attention_mask"]
             if "image_sizes" in batch:
