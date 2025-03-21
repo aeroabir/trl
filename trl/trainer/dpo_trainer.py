@@ -144,6 +144,20 @@ class DataCollatorForPreference(DataCollatorMixin):
         if "ref_chosen_logps" in examples[0] and "ref_rejected_logps" in examples[0]:
             ref_chosen_logps = torch.tensor([example["ref_chosen_logps"] for example in examples])
             ref_rejected_logps = torch.tensor([example["ref_rejected_logps"] for example in examples])
+        # phi-4mm inputs
+        if 'input_image_embeds' in examples[0] and examples[0]['input_image_embeds'] is not None:
+            input_image_embeds = torch.tensor([example["input_image_embeds"] for example in examples])
+        else:
+            input_image_embeds = [None] * len(examples)
+        if 'image_attention_mask' in examples[0] and examples[0]['image_attention_mask'] is not None:
+            image_attention_mask = torch.tensor([example["image_attention_mask"] for example in examples])
+        else:
+            image_attention_mask = [None] * len(examples)
+        if 'input_mode' in examples[0] and examples[0]['input_mode'] is not None:
+            input_mode = torch.tensor([example["input_mode"] for example in examples])
+        else:
+            input_mode = [None] * len(examples)
+
 
         # Pad
         output = {}
@@ -159,6 +173,12 @@ class DataCollatorForPreference(DataCollatorMixin):
             output["pixel_attention_mask"] = pad(pixel_attention_mask, padding_value=0)
         if "image_sizes" in examples[0]:
             output["image_sizes"] = torch.tensor([example["image_sizes"] for example in examples])
+        if 'input_mode' in examples[0]:
+            output['input_mode'] = input_mode
+        if 'input_image_embeds' in examples[0]:
+            output['input_image_embeds'] = input_image_embeds  # pad(input_image_embeds, padding_value=0.0)
+        if 'image_attention_mask' in examples[0]:
+            output['image_attention_mask'] = image_attention_mask  # pad(image_attention_mask, padding_value=0.0)
         if "ref_chosen_logps" in examples[0] and "ref_rejected_logps" in examples[0]:
             output["ref_chosen_logps"] = ref_chosen_logps
             output["ref_rejected_logps"] = ref_rejected_logps
@@ -466,13 +486,9 @@ class DPOTrainer(Trainer):
 
         # Dataset preparation
         # Dataset has the following keys: ['chosen', 'rejected', 'images', 'prompt']
-        # print(train_dataset[0].keys())
         train_dataset = self._prepare_dataset(train_dataset, processing_class, args, "train")
         # Dataset has the following keys:
         # ['images', 'prompt_input_ids', 'pixel_values', 'chosen_input_ids', 'rejected_input_ids', 'image_sizes']
-        # print(train_dataset[0].keys())
-        # print(train_dataset[0]['prompt_input_ids'], len(train_dataset[0]['prompt_input_ids']))
-        # sys.exit('Abir: DPOTrainer')
         if eval_dataset is not None:
             if isinstance(eval_dataset, dict):
                 eval_dataset = {
@@ -555,6 +571,7 @@ class DPOTrainer(Trainer):
         if isinstance(dataset, Dataset):  # IterableDataset does not support num_proc
             map_kwargs["num_proc"] = args.dataset_num_proc
 
+        # source_code = inspect.getsource(self.process_row)
         with PartialState().local_main_process_first():
             # Extract prompt if needed
             if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
@@ -572,12 +589,10 @@ class DPOTrainer(Trainer):
             if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
                 map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset"
 
-            # print("Here-Abir", self.is_vision_model)
-            # print(dataset)
-            # print(args.max_prompt_length, args.max_completion_length)
             dataset = dataset.map(
                 self.tokenize_row if not self.is_vision_model else self.process_row,
-                remove_columns=["prompt", "chosen", "rejected"],
+                # remove_columns=["prompt", "chosen", "rejected"],
+                remove_columns=[],
                 fn_kwargs={
                     "processing_class": processing_class,
                     "max_prompt_length": args.max_prompt_length,
@@ -587,6 +602,8 @@ class DPOTrainer(Trainer):
                 },
                 **map_kwargs,
             )
+            # import pdb
+            # pdb.set_trace()
 
         return dataset
 
@@ -662,6 +679,9 @@ class DPOTrainer(Trainer):
         # prompt and images need to be processed together
         # processed_features = processor(images=features["images"], text=features["prompt"], add_special_tokens=False)
         processed_features = processor(images=features["images"], text=features["prompt"])
+        # for k, v in processed_features.items():
+        #     print(k, v.shape if v is not None else None)
+
         prompt_input_ids = processed_features["input_ids"][0]
         # if there is no image input then processor does not return 'pixel_values'
         if "pixel_values" in processed_features:
@@ -692,12 +712,30 @@ class DPOTrainer(Trainer):
             "pixel_values": pixel_values,
             "chosen_input_ids": chosen_input_ids,
             "rejected_input_ids": rejected_input_ids,
+            "all_keys": list(processed_features.keys()),
         }
+
+        # import pdb
+        # pdb.set_trace()
 
         if "pixel_attention_mask" in processed_features:
             output["pixel_attention_mask"] = processed_features["pixel_attention_mask"][0]
         if "image_sizes" in processed_features:
             output["image_sizes"] = processed_features["image_sizes"][0]
+        if "input_image_embeds" in processed_features:
+            output["input_image_embeds"] = processed_features["input_image_embeds"][0]
+        if "image_attention_mask" in processed_features:
+            output["image_attention_mask"] = processed_features["image_attention_mask"][0]
+        if "input_mode" in processed_features:
+            output["input_mode"] = processed_features["input_mode"][0]
+
+        # for k, v in output.items():
+        #     if k == "all_keys":
+        #         continue
+        #     if type(v) is list:
+        #         print(k, len(v))
+        #     else:
+        #         print(k, v.shape if v is not None else None)
 
         return output
 
@@ -927,6 +965,12 @@ class DPOTrainer(Trainer):
             )
         if "image_sizes" in batch:
             output["image_sizes"] = torch.cat([batch["image_sizes"], batch["image_sizes"]], dim=0)
+
+        phi4_cols = ['input_mode', 'input_image_embeds', 'image_attention_mask']
+        for col in phi4_cols:
+            if col in batch:
+                # print(col, batch[col].shape)  # Abir
+                output[col] = torch.cat([batch[col], batch[col]], dim=0)
 
         # Concatenate the chosen and rejected completions
         max_completion_length = max(batch["chosen_input_ids"].shape[1], batch["rejected_input_ids"].shape[1])
@@ -1179,7 +1223,7 @@ class DPOTrainer(Trainer):
         # print(f"Max. sequence length: {input_ids.shape}")
         # print('input_ids', input_ids.shape)
         # for k, v in model_kwargs.items():
-        #     print(k, v.shape if type(v) is not list else len(v))
+            # print(k, v.shape if type(v) is not list else len(v))
         outputs = model(input_ids, **model_kwargs)
         logits = outputs.logits  # (batch_size, seq_len, vocab_dimension)
 
@@ -1229,24 +1273,10 @@ class DPOTrainer(Trainer):
         """
         num_examples = batch["prompt_input_ids"].shape[0]
         # print(f"Number of examples: {num_examples}")
-        # for k, v in batch.items():
-        #     print(k, v.shape if type(v) is not list else len(v))
-        # prompt_input_ids torch.Size([1, 512])
-        # prompt_attention_mask torch.Size([1, 512])
-        # chosen_input_ids torch.Size([1, 33])
-        # chosen_attention_mask torch.Size([1, 33])
-        # rejected_input_ids torch.Size([1, 41])
-        # rejected_attention_mask torch.Size([1, 41])
-        # image_sizes torch.Size([1, 2])
 
         concatenated_batch = self.concatenated_inputs(batch, padding_value=self.padding_value)
-        # prompt_input_ids torch.Size([2, 512])
-        # prompt_attention_mask torch.Size([2, 512])
-        # image_sizes torch.Size([2, 2])
-        # completion_input_ids torch.Size([2, 41])
-        # completion_attention_mask torch.Size([2, 41])
         # for k, v in concatenated_batch.items():
-        #     print(k, v.shape if type(v) is not list else len(v))
+            # print(k, v.shape if type(v) is not list else len(v))
 
         model_kwargs = {}
         if self.aux_loss_enabled:
@@ -1260,6 +1290,12 @@ class DPOTrainer(Trainer):
         if "image_sizes" in concatenated_batch:
             model_kwargs["image_sizes"] = concatenated_batch["image_sizes"]
 
+        # phi-4-mm inputs
+        phi4_cols = ['input_mode', 'input_image_embeds', 'image_attention_mask']
+        for col in phi4_cols:
+            if col in concatenated_batch:
+                model_kwargs[col] = concatenated_batch[col]
+
         prompt_input_ids = concatenated_batch["prompt_input_ids"]
         prompt_attention_mask = concatenated_batch["prompt_attention_mask"]
         completion_input_ids = concatenated_batch["completion_input_ids"]
@@ -1268,9 +1304,9 @@ class DPOTrainer(Trainer):
         # Phi-3.5-vision is not encoder_decoder
         # print("Current Model:", self.is_encoder_decoder)
         if model.config.model_type == 'phi3_v':
+        # if model.config.model_type in ('phi3_v', 'phi4mm'):
             # Need to handle prompt and completion separately
-            # since batch_size cannot be more than 1 (concatenation will make
-            # batch size = 2)
+            # since batch_size cannot be more than 1 (concatenation will make, batch size = 2)
             # first process the chosen
             prompt_input_ids = batch["prompt_input_ids"]
             prompt_attention_mask = batch["prompt_attention_mask"]
@@ -1295,6 +1331,12 @@ class DPOTrainer(Trainer):
                 model_kwargs["pixel_attention_mask"] = batch["pixel_attention_mask"]
             if "image_sizes" in batch:
                 model_kwargs["image_sizes"] = batch["image_sizes"]
+
+            # phi-4-mm inputs
+            phi4_cols = ['input_mode', 'input_image_embeds', 'image_attention_mask']
+            for col in phi4_cols:
+                if col in batch:
+                    model_kwargs[col] = batch[col]
 
             chosen_logits, chosen_labels, chosen_loss_mask, chosen_logps = \
                 self.single_forward(model, model_kwargs, input_ids, attention_mask, loss_mask)
@@ -1357,7 +1399,6 @@ class DPOTrainer(Trainer):
 
             return output
 
-
         elif self.is_encoder_decoder:
             labels = completion_input_ids
             labels[completion_attention_mask == 0] = self.label_pad_token_id
@@ -1369,6 +1410,7 @@ class DPOTrainer(Trainer):
             )
             logits = outputs.logits
             loss_mask = completion_attention_mask.bool()
+
         else:
             # Concatenate the prompt and completion inputs
             input_ids = torch.cat((prompt_input_ids, completion_input_ids), dim=1)
@@ -1517,6 +1559,9 @@ class DPOTrainer(Trainer):
     ):
         """Compute the DPO loss and other metrics for the given batch of inputs for train or test."""
         metrics = {}
+
+        # print("get_batch_loss_metrics: Abir")
+        # print(batch.keys())
 
         model_output = self.concatenated_forward(model, batch)
 
